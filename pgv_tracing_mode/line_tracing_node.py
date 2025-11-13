@@ -153,19 +153,30 @@ class LineDriveNode(Node):
         self.declare_parameter('sensor_yaw_offset_deg', 0.0)
         self.declare_parameter('sensor_x_offset', 0.0)
         self.declare_parameter('sensor_y_offset', 0.0)
+        # Optional: rotate entire incoming pose frame by 180 deg (invert x,y and add π to yaw)
+        # Use this when the sensor frame is physically reversed along the line axis and you
+        # prefer to normalize it up-front instead of allowing reverse heading in control.
+        self.declare_parameter('flip_sensor_pose_180', False)
+        # If true, treat facing +x or -x (180 deg) as equivalent; choose minimal yaw rotation.
+        # Helps when sensor yaw offset is 180 deg and controller oscillates around ±180 boundary.
+        self.declare_parameter('allow_reverse_heading', False)
+        # Angular stability / smoothing parameters
+        self.declare_parameter('yaw_flip_band_deg', 15.0)   # hysteresis band for choosing +x vs -x (deg)
+        self.declare_parameter('yaw_w_ema_alpha', 0.3)      # EMA alpha for smoothing angular velocity
+        self.declare_parameter('yaw_w_deadband', 0.02)      # deadband under which w_cmd is forced to zero
 
         # Simple P gains
         self.declare_parameter('kp_x', 1.0)
         self.declare_parameter('kp_y', 1.0)
         self.declare_parameter('kp_yaw', 2.0)
 
-    # ---------------- 파라미터 값 조회 ----------------
+        # ---------------- 파라미터 값 조회 ----------------
         self.pose_topic = self.get_parameter('pose_topic').value
         self.cmd_topic = self.get_parameter('cmd_topic').value
         self.holonomic = bool(self.get_parameter('holonomic').value)
 
 
-    # deg → rad 변환
+        # deg → rad 변환
         self.yaw_align_threshold = math.radians(float(self.get_parameter('yaw_align_threshold_deg').value))
         self.tol_yaw = math.radians(float(self.get_parameter('tolerance_yaw_deg').value))
         self.yaw_hysteresis_factor = float(self.get_parameter('yaw_hysteresis_factor').value)
@@ -188,10 +199,15 @@ class LineDriveNode(Node):
         self.sensor_yaw_offset = math.radians(float(self.get_parameter('sensor_yaw_offset_deg').value))
         self.sensor_x_offset = float(self.get_parameter('sensor_x_offset').value)
         self.sensor_y_offset = float(self.get_parameter('sensor_y_offset').value)
+        self.allow_reverse_heading = bool(self.get_parameter('allow_reverse_heading').value)
+        self.flip_sensor_pose_180 = bool(self.get_parameter('flip_sensor_pose_180').value)
 
         self.kp_x = float(self.get_parameter('kp_x').value)
         self.kp_y = float(self.get_parameter('kp_y').value)
         self.kp_yaw = float(self.get_parameter('kp_yaw').value)
+        self.yaw_flip_band = math.radians(float(self.get_parameter('yaw_flip_band_deg').value))
+        self.yaw_w_ema_alpha = float(self.get_parameter('yaw_w_ema_alpha').value)
+        self.yaw_w_deadband = float(self.get_parameter('yaw_w_deadband').value)
 
     # QoS: 고속/간헐 손실 허용 센서 대비 BEST_EFFORT + 작은 depth
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -220,6 +236,10 @@ class LineDriveNode(Node):
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0  # radians, angle around +z, yaw=0 is aligned with line +x
+        # Yaw orientation hysteresis (+1 chooses +x, -1 chooses -x). Reset on new align phase.
+        self.chosen_yaw_polarity = None
+        # EMA state for angular velocity smoothing
+        self.w_cmd_ema = 0.0
 
     # 목표 관리: 절대 x 또는 상대 Δx (start_x_for_rel 기준)
         self.goal_active = False
@@ -249,8 +269,8 @@ class LineDriveNode(Node):
         # PoseStamped에서 x,y,yaw 추출
         # builtin_interfaces.msg.Time → rclpy Time 변환 (시간 연산 가능하도록)
         self.last_pose_time = rclpy.time.Time.from_msg(msg.header.stamp)
-        self.x = msg.pose.position.x + self.sensor_x_offset
-        self.y = msg.pose.position.y + self.sensor_y_offset
+        raw_x = msg.pose.position.x
+        raw_y = msg.pose.position.y
 
         # yaw from quaternion (assuming z,w only valid; still do robust)
         qx, qy, qz, qw = msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w
@@ -259,8 +279,19 @@ class LineDriveNode(Node):
         cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
-        # 센서 yaw 오프셋 적용 후 정규화된 yaw 저장
-        self.yaw = ang_norm(yaw + self.sensor_yaw_offset)
+        # 센서 yaw 오프셋 적용
+        yaw_with_offset = ang_norm(yaw + self.sensor_yaw_offset)
+
+        # 좌표/자세 180도 프레임 반전(옵션): x,y를 뒤집고 yaw에 π 추가
+        if self.flip_sensor_pose_180:
+            raw_x = -raw_x
+            raw_y = -raw_y
+            yaw_with_offset = ang_norm(yaw_with_offset + math.pi)
+
+        # 오프셋 적용 후 저장
+        self.x = raw_x + self.sensor_x_offset
+        self.y = raw_y + self.sensor_y_offset
+        self.yaw = yaw_with_offset
 
     def _on_rel_goal(self, msg: Float64):
         """상대 x 목표 처리: 현재 x를 기준으로 Δx 설정 후 목표 활성화."""
@@ -342,14 +373,17 @@ class LineDriveNode(Node):
         """ALIGN_YAW 단계로 전이."""
         self.phase = Phase.ALIGN_YAW
         self.slow_start_until = None
+        # reset orientation hysteresis so we re-decide cleanly
+        self.chosen_yaw_polarity = None
 
     def _enter_align_y_only(self):
         """ALIGN_Y_ONLY 단계로 전이; yaw 히스테리시스 상태 초기화."""
         self.phase = Phase.ALIGN_Y_ONLY
         # initialize yaw correction state based on current yaw error
-        yaw_err = abs(ang_norm(0.0 - self.yaw))
+        yaw_err = abs(self._compute_yaw_err())
         self.yaw_correction_active = yaw_err > self.tol_yaw
         self.get_logger().info("[align_y_only] started")
+        self.chosen_yaw_polarity = None
 
     def _enter_slow_start(self):
         """SLOW_START (마이크로 전진) 단계로 전이."""
@@ -478,13 +512,21 @@ class LineDriveNode(Node):
 
         y-only 정렬 요청이면 ALIGN_Y_ONLY로, 아니면 SLOW_START로 분기.
         """
-        yaw_err = ang_norm(0.0 - self.yaw)
+        yaw_err = self._compute_yaw_err()
+        self.get_logger().info(f"[align] yaw_err={math.degrees(yaw_err):.2f} deg")
         # P controller on yaw
-        w_cmd = self.kp_yaw * yaw_err
-        w_cmd = self._slew_limit(w_cmd, self.last_twist.angular.z, self.acc_w / self.rate_hz)
-        w_cmd = max(-self.max_w, min(self.max_w, w_cmd))
-        # keep linear zero during alignment
-        self._publish_twist(0.0, 0.0, w_cmd)
+        w_raw = self.kp_yaw * yaw_err
+        # slew limit then clamp
+        w_limited = self._slew_limit(w_raw, self.last_twist.angular.z, self.acc_w / self.rate_hz)
+        w_limited = max(-self.max_w, min(self.max_w, w_limited))
+        # deadband
+        if abs(w_limited) < self.yaw_w_deadband:
+            w_limited = 0.0
+        # EMA smoothing
+        alpha = self.yaw_w_ema_alpha
+        self.w_cmd_ema = alpha * w_limited + (1.0 - alpha) * self.w_cmd_ema
+        # publish (linear velocities kept zero during yaw alignment)
+        self._publish_twist(0.0, 0.0, self.w_cmd_ema)
 
         if abs(yaw_err) <= self.yaw_align_threshold:
             # 완료 시 분기: y-align 요청이 있으면 ALIGN_Y_ONLY로, 아니면 기존 slow-start
@@ -508,7 +550,7 @@ class LineDriveNode(Node):
             return
 
         # yaw 드리프트가 커지면 미세 보정 허용 (hysteresis 적용)
-        yaw_err_raw = ang_norm(0.0 - self.yaw)
+        yaw_err_raw = self._compute_yaw_err()
         yaw_abs = abs(yaw_err_raw)
         # Activate correction only if beyond outer band
         if not self.yaw_correction_active and yaw_abs > (self.tol_yaw * self.yaw_hysteresis_factor):
@@ -519,11 +561,13 @@ class LineDriveNode(Node):
 
         w_cmd = 0.0
         if self.yaw_correction_active:
-            w_cmd_raw = self.kp_yaw * yaw_err_raw
-            # small deadband to avoid jitter
-            if abs(w_cmd_raw) < 0.02:
-                w_cmd_raw = 0.0
-            w_cmd = max(-0.2, min(0.2, w_cmd_raw))
+            w_raw = self.kp_yaw * yaw_err_raw
+            if abs(w_raw) < self.yaw_w_deadband:
+                w_raw = 0.0
+            w_limited = max(-0.2, min(0.2, w_raw))
+            alpha = self.yaw_w_ema_alpha
+            self.w_cmd_ema = alpha * w_limited + (1.0 - alpha) * self.w_cmd_ema
+            w_cmd = self.w_cmd_ema
 
         # vy만 사용해서 y를 0으로 수렴 (vx=0)
         y_err = -self.y
@@ -572,7 +616,7 @@ class LineDriveNode(Node):
 
         x_err = x_target - self.x
         y_err = - self.y           # we want y -> 0
-        yaw_err = ang_norm(0.0 - self.yaw)  # we want yaw -> 0
+        yaw_err = self._compute_yaw_err()  # we want yaw -> 0 (or π if reverse allowed)
 
         # Goal check
         if abs(x_err) <= self.tol_xy and abs(self.y) <= self.tol_xy:
@@ -637,6 +681,43 @@ class LineDriveNode(Node):
         if delta < -step:
             return current - step
         return target
+
+    def _compute_yaw_err(self, desired: float = 0.0) -> float:
+        """Compute yaw error as deviation from X-axis, allowing ±X equivalence.
+
+        새 요구사항: "x축에서 떨어진 각도차이"를 yaw 에러로 정의. 즉 로봇이 +x(0 rad)를 향하든
+        -x(π rad)를 향하든 둘 다 정렬된 방향으로 간주하고, 현재 자세에서 가장 작은 회전량을
+        반환한다. 부호는 그 최소 회전을 달성하기 위한 회전 방향(sign)이다.
+
+        절차:
+            1. err_to_plus = ang_norm(0 - yaw)
+            2. err_to_minus = ang_norm(pi - yaw)
+            3. 두 값 중 절대값이 더 작은 것을 선택
+        결과적으로 wrap 경계(±π) 부근에서 179↔-179 진동이 사라지고, 로봇이 이미 -x를 보고
+        있다면 회전하지 않는다.
+
+        Note: 이 로직은 이전 allow_reverse_heading 파라미터와 동일한 개념을 강제 적용한다.
+        desired 매개변수는 이제 무시되며 항상 x축 기준(+x/-x) 최소 편차를 사용.
+
+        Returns:
+            float: signed yaw error radians (P제어 입력)
+        """
+        # 현재 yaw
+        yaw_now = self.yaw
+        err_to_plus = ang_norm(0.0 - yaw_now)
+        err_to_minus = ang_norm(math.pi - yaw_now)
+
+        diff = abs(err_to_plus) - abs(err_to_minus)
+        if self.chosen_yaw_polarity is None:
+            self.chosen_yaw_polarity = +1 if abs(err_to_plus) <= abs(err_to_minus) else -1
+        else:
+            # Hysteresis: only switch when firmly outside band
+            if self.chosen_yaw_polarity == +1 and diff > self.yaw_flip_band:
+                self.chosen_yaw_polarity = -1
+            elif self.chosen_yaw_polarity == -1 and diff < -self.yaw_flip_band:
+                self.chosen_yaw_polarity = +1
+
+        return err_to_plus if self.chosen_yaw_polarity == +1 else err_to_minus
 
 
 def main(args=None):
