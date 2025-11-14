@@ -95,6 +95,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import Float64, Bool
 from std_srvs.srv import Trigger
+from pitin_msgs.msg import NavCommander, NavStatus
 
 
 def ang_norm(a):
@@ -212,10 +213,12 @@ class LineDriveNode(Node):
                          history=HistoryPolicy.KEEP_LAST, depth=5)
 
     # ---------------- I/O (토픽/서비스) ----------------
+        self.nav_cmd_sub = self.create_subscription(NavCommander, 'amr1/nav_command', self.nav_commander_callback, 10)
         self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, qos)
         self.rel_goal_sub = self.create_subscription(Float64, '/line_drive/relative_x_goal', self._on_rel_goal, 10)
         self.abs_goal_sub = self.create_subscription(Float64, '/line_drive/absolute_x_goal', self._on_abs_goal, 10)
         self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, 10)
+        self.nav_status_pub = self.create_publisher(NavStatus, 'amr1/nav_status', 10)
 
         self.srv_align = self.create_service(Trigger, '/line_drive/align_to_line', self._srv_align)
         self.srv_nudge = self.create_service(Trigger, '/line_drive/nudge_forward', self._srv_nudge)
@@ -265,6 +268,24 @@ class LineDriveNode(Node):
         self.get_logger().info(f"[line_drive] holonomic={self.holonomic}, cmd_topic={self.cmd_topic}, pose_topic={self.pose_topic}")
 
     # ---------------- Subscribers ----------------
+    def nav_commander_callback(self,msg: NavCommander):
+        self.req_id = msg.reqid
+        self.seq_id = msg.seqid
+
+        command = msg.cmd
+        self.mode = msg.mode
+
+        if command == NavCommander.CMD_START:
+            self.info(f'Nav_Commander Received: CMD_START, Mode: {msg.mode}, Target_Point: {msg.target_point}, Target_Points: {msg.target_points}, Poses: {len(msg.poses)}')
+            if msg.mode == NavCommander.MODE_GOTO:
+                self.goal_abs_x = float(msg.target_point)
+                self.goal_rel_dx = None
+                self.start_x_for_rel = None
+                self.goal_active = True
+                self._enter_align_phase()
+                self.get_logger().info(f"[goal] absolute x*={self.goal_abs_x:.3f} m")
+
+
     def _on_pose(self, msg: PoseStamped):
         # PoseStamped에서 x,y,yaw 추출
         # builtin_interfaces.msg.Time → rclpy Time 변환 (시간 연산 가능하도록)
@@ -547,6 +568,11 @@ class LineDriveNode(Node):
         if self.phase == Phase.DONE:
             # keep stopped
             self._publish_twist(0.0, 0.0, 0.0)
+            nav_status_msg = NavStatus()
+            nav_status_msg.reqid = self.req_id
+            nav_status_msg.seqid = self.seq_id
+            nav_status_msg.state = NavStatus.SUCCEEDED
+            self.nav_status_pub.publish(nav_status_msg)
             return
 
     # ---------------- Behaviors ----------------
