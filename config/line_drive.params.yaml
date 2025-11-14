@@ -100,6 +100,5 @@ line_drive:
 
     kp_yaw: 1.0                    # yaw오차 → ω 명령 크기(정렬 및 비홀로노믹 주행에서 중요).
                                    # 너무 크면 흔들림, 너무 작으면 정렬 지연.
-
-  align_y_only_max_ang_vel: 0.2  # [rad/s] ALIGN_Y_ONLY 단계의 부드러운 yaw 미세 보정 최대 속도 (소프트 클램프 용).
-                   # tanh 기반 포화 적용 시 상한. 현재 기본 로직에서는 사용 비활성(주석 처리) 가능.
+    align_y_only_max_ang_vel: 0.2  # [rad/s] ALIGN_Y_ONLY 단계 부드러운 yaw 미세 보정 최대 속도(soft clamp).
+                   # 필요 시 Y-only 정렬에서 주석 해제해 tanh 포화 로직과 함께 사용 가능.
