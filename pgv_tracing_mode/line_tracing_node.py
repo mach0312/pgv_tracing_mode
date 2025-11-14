@@ -7,83 +7,80 @@
     * 라인 방향으로의 요(yaw) 정렬 (Phase.ALIGN_YAW)
     * 요 정렬 후 짧은 마이크로 전진(SLOW_START)으로 부드러운 시작
     * 절대 또는 상대 X 목표 주행 + Y=0 유지 (Phase.RUNNING)
-    * 홀로노믹 전용 Y축 정렬 서비스 (ALIGN_Y_ONLY) - 전진 없이 횡방향 보정
+    * 홀로노믹 전용 Y축 정렬 서비스 (ALIGN_Y_ONLY) - 전진 없이 횡방향 보정 (Yaw 히스테리시스 포함)
     * Bool 토픽을 이용한 수동 hold-to-run 방식 전/후진 오버라이드
-    * Pose 업데이트 타임아웃 시 안전 정지
+    * Pose 업데이트 타임아웃 감지 및 안전 정지
+    * 타임아웃 후 재인식 시 일정 "유예(grace) 시간" 동안 정지 유지 (post_timeout_grace_sec)
 
 상태 머신 (Phase):
-    IDLE         : 대기 상태 (정지), 목표나 정렬 요청 없음
-    ALIGN_YAW    : 요 오차를 기준 임계값 이하로 줄이기 위한 제자리 회전
-    SLOW_START   : 짧은 시간 저속 전진으로 기계적/센서적 워밍업
-    RUNNING      : 목표 X로 이동하면서 Y, Yaw 안정화
-    DONE         : 목표 또는 정렬 완료 후 정지
-    ALIGN_Y_ONLY : 홀로노믹 전용 Y축 정렬 (Yaw 보정 히스테리시스 포함)
+    IDLE         : 대기 (정지)
+    ALIGN_YAW    : yaw 오차 임계값 이하로 줄이기 위한 제자리 회전
+    SLOW_START   : 짧은 저속 전진으로 기계적/센서적 워밍업
+    RUNNING      : X 목표로 주행하며 Y, Yaw 안정화
+    DONE         : 목표/정렬 완료 후 정지
+    ALIGN_Y_ONLY : 홀로노믹 전용 Y축 정렬 (yaw 히스테리시스 적용)
 
 서비스:
-    /line_drive/align_to_line    (Trigger): 일반 요 정렬 시작 (ALIGN_YAW → SLOW_START → RUNNING)
-    /line_drive/nudge_forward    (Trigger): 즉시 SLOW_START 수행 (마이크로 전진)
-    /line_drive/align_y_only     (Trigger): 필요 시 요 정렬 후 Y축 정렬 (ALIGN_YAW → ALIGN_Y_ONLY)
+    /line_drive/align_to_line    : 일반 yaw 정렬 시작 (ALIGN_YAW → SLOW_START → RUNNING)
+    /line_drive/nudge_forward    : 즉시 짧은 마이크로 전진(SLOW_START)
+    /line_drive/align_y_only     : 필요 시 yaw 정렬 후 Y축 정렬 (ALIGN_YAW → ALIGN_Y_ONLY)
 
 토픽:
     pose_topic (PoseStamped)           : 센서 포즈 (라인 프레임)
-    /line_drive/relative_x_goal (Float64): 현재 x 기준 상대 이동 목표 (Δx)
-    /line_drive/absolute_x_goal (Float64): 절대 x 목표
-    /line_drive/go_forward (Bool)        : 수동 전진 hold 신호 (TRUE 펄스 유지)
-    /line_drive/go_backward (Bool)       : 수동 후진 hold 신호
-    cmd_topic (Twist)                    : 속도 명령 (vx, vy, wz)
+    /line_drive/relative_x_goal (Float64) : 상대 Δx 목표
+    /line_drive/absolute_x_goal (Float64) : 절대 x 목표
+    /line_drive/go_forward (Bool)         : 수동 전진 hold 펄스
+    /line_drive/go_backward (Bool)        : 수동 후진 hold 펄스
+    cmd_topic (Twist)                     : 속도 명령 (vx, vy, wz or v, w)
 
-수동 hold-to-run 로직:
-    TRUE 메시지 수신 시 타임스탬프 저장. `manual_timeout` 초 이내면 활성 유지.
-    전진/후진 둘 다 활성 시 안전을 위해 0 (정지) 처리.
-    수동 입력은 각 제어 주기에서 자동 목표보다 우선.
+수동 hold-to-run:
+    각 방향 Bool TRUE 수신 → 타임스탬프 기록 → manual_timeout 내 유지.
+    둘 다 TRUE → 안전 정지.
+    수동 활성 시 자동 목표보다 우선.
 
-주요 파라미터 (모두 __init__에서 declare):
-    pose_topic (str)                : 입력 포즈 토픽
-    cmd_topic (str)                 : 출력 Twist 토픽
-    holonomic (bool)                : True면 vx, vy 사용; False면 v, w 사용
-    yaw_align_threshold_deg (float) : ALIGN_YAW 완료 기준 (deg)
-    tolerance_yaw_deg (float)       : 안정 yaw 판정 허용 오차 (deg)
-    yaw_hysteresis_factor (float)   : ALIGN_Y_ONLY에서 yaw 보정 활성 임계 다중값
-    tolerance_xy (float, m)         : x,y 목표/정렬 완료 허용 오차
-    pose_timeout_sec (float)        : pose 미수신 안전 정지 시간
-    control_rate (Hz)               : 제어 루프 주파수
-    max_lin_vel, max_ang_vel        : 최대 선속도 / 각속도
-    accel_lin, accel_ang            : 제어 주기당 가속(슬루) 제한
-    slow_start_duration (s)         : SLOW_START 지속 시간
-    slow_start_speed (m/s)          : SLOW_START 속도
-    teleop_speed (m/s)              : 수동 전/후진 기본 속도
-    manual_timeout (s)              : hold-to-run TRUE 유지 시간
-    sensor_* offsets                : 센서 포즈 보정 오프셋 및 yaw 오프셋
-    kp_x, kp_y, kp_yaw              : 단순 P 게인
+주요 파라미터 (declare):
+    pose_timeout_sec            : pose 미수신 판정 시간.
+    post_timeout_grace_sec      : 타임아웃 이후 pose 회복 시 재제어 시작까지 정지 유지하는 유예 시간.
+    yaw_align_threshold_deg     : ALIGN_YAW 완료 기준 (deg).
+    tolerance_yaw_deg           : yaw 안정 판정 허용 오차.
+    yaw_hysteresis_factor       : ALIGN_Y_ONLY에서 yaw 보정 ON 임계 (tol * factor).
+    allow_reverse_heading       : ±180°를 라인 방향으로 허용하면 reverse 정렬도 완료로 인정.
+    kp_x, kp_y, kp_yaw          : 단순 P 게인.
+
+Yaw 에러 정의:
+    _yaw_err()는 (yaw_meas - target) 형태의 오차를 반환.
+    기본 target=0(+X). reverse 허용 시 0 또는 ±π 중 |yaw - target_candidate|가 더 작은 쪽 선택.
+    제어식은 w = -kp_yaw * yaw_err (음의 피드백).
+    경계(±π) 근처 sign flip 억제를 위해 wrap band + yaw_sign_fixed 사용.
 
 Yaw 히스테리시스 (ALIGN_Y_ONLY):
-    |yaw_err| > tol_yaw * yaw_hysteresis_factor 일 때 보정 활성
-    |yaw_err| <= tol_yaw 일 때 비활성
-    매우 작은 w_cmd (<0.02 rad/s) 데드밴드로 지터 억제
+    |yaw_err| > tol_yaw * factor → yaw 보정 활성.
+    |yaw_err| ≤ tol_yaw → 비활성.
+    (현재 w_cmd 보정 블록은 주석 처리되어 부드러운 vy-only 정렬 모드로 동작; 필요 시 활성화 가능.)
+
+안전 / 타임아웃 처리:
+    pose_timeout_sec 초 동안 pose 미수신 → 즉시 STOP, timeout_active=True.
+    새 pose 수신 첫 주기 → post_timeout_grace_sec 동안 추가 정지 (grace) 후 제어 재개.
+    grace 중 수동 입력도 무시.
 
 완료 조건:
-    RUNNING 목표: |x_err| <= tol_xy AND |y| <= tol_xy
-    Y 정렬: |y| <= tol_xy AND yaw 안정(보정 비활성 & |yaw_err| <= tol_yaw)
+    RUNNING 목표: |x_err| ≤ tol_xy AND |y| ≤ tol_xy.
+    Y 정렬: |y| ≤ tol_xy AND yaw 안정(|yaw_err| ≤ tol_yaw, 보정 비활성).
 
-사용 예시:
-    기본 실행:
-        ros2 launch pgv_tracing_mode line_drive.launch.py
-    파라미터 오버라이드:
-        ros2 run pgv_tracing_mode line_drive --ros-args -p holonomic:=true -p yaw_hysteresis_factor:=2.0
-    상대 목표 설정:
-        ros2 topic pub /line_drive/relative_x_goal std_msgs/Float64 "data: 0.5"
-    Y 정렬 서비스 호출:
-        ros2 service call /line_drive/align_y_only std_srvs/srv/Trigger {}
-    수동 전진 펄스:
-        ros2 topic pub /line_drive/go_forward std_msgs/Bool "data: true"
+사용 예:
+    ros2 launch pgv_tracing_mode line_drive.launch.py
+    ros2 run pgv_tracing_mode line_drive --ros-args -p post_timeout_grace_sec:=1.5
+    ros2 topic pub /line_drive/relative_x_goal std_msgs/Float64 "data: 0.5"
+    ros2 service call /line_drive/align_y_only std_srvs/srv/Trigger {}
+    ros2 topic pub /line_drive/go_forward std_msgs/Bool "data: true"
 
-향후 개선 아이디어 (미구현):
-    * Y / Yaw 안정성 시간 기반 카운트 후 완료 처리
-    * Yaw 에러 EMA 필터로 각속도 부드럽게
-    * 남은 거리/속도 기반 적응형 게인
+향후 개선 아이디어:
+    * yaw_err EMA 필터 / deadband 정교화
+    * 목표 거리 기반 적응형 속도/게인
+    * grace 종료 후 자동 재정렬 옵션
+    * 정렬 완료 안정 시간 카운트
 
-본 파일은 가독성을 위해 많은 주석이 포함되어 있으며,
-상태 전이 로직을 변경할 때는 문서화된 흐름을 유지하는 것이 좋습니다.
+본 파일은 많은 주석을 포함하고 있으며 로직 수정 시 문서화 흐름 유지가 중요합니다.
 """
 
 import math
@@ -139,7 +136,7 @@ class LineDriveNode(Node):
         self.declare_parameter('yaw_hysteresis_factor', 1.5)
         self.declare_parameter('tolerance_xy', 0.01)  # [m]
         self.declare_parameter('pose_timeout_sec', 0.2)  # 200ms 동안 pose 안 들어오면 stop
-        # Timeout 후 제어 재개 유예시간 (초) - pose 다시 들어와도 이 시간 동안은 정지 유지
+    # Timeout 후 제어 재개 유예시간 (초) - pose 다시 들어와도 이 시간(grace) 동안은 정지 유지
         self.declare_parameter('post_timeout_grace_sec', 1.0)
 
         self.declare_parameter('control_rate', 50.0)  # Hz
@@ -232,7 +229,7 @@ class LineDriveNode(Node):
         self.phase = Phase.IDLE
         self.last_twist = Twist()
         self.last_pose_time = self.get_clock().now()
-        # Pose 미수신 timeout 상태 및 재개 grace 상태 관리
+    # Pose 미수신 timeout 상태 및 재개 grace 상태 관리
         self.timeout_active = False
         self.resume_block_until = None  # rclpy Time; None이면 grace 없음
         self._last_grace_log_time = None
@@ -475,13 +472,21 @@ class LineDriveNode(Node):
 
     # ---------------- Control loop ----------------
     def _control_loop(self):
-        """주기적 제어 루프 (우선순위 순서):
-        1) 안전 타임아웃 검사
-        2) 수동 hold-to-run 처리
-        3) 상태(Phase)별 자동 동작
+        """주기적 제어 루프.
+
+        순서:
+            (A) pose timeout 검사 및 STOP / grace 처리
+            (B) manual hold-to-run (grace 중이면 이미 return)
+            (C) 목표 없으면 정지
+            (D) 상태 머신 실행
+
+        grace 로직:
+            timeout 발생 → 즉시 STOP.
+            pose 회복 첫 틱 → resume_block_until 설정 후 그 시각까지 모든 제어 차단.
+            grace 동안 주기적 남은 시간 로그.
         """
         now = self.get_clock().now()
-        # 1) Pose timeout 감지: 멈추고 timeout_active 설정
+    # (A1) Pose timeout 감지: 멈추고 timeout_active 설정
         if (now - self.last_pose_time) > Duration(seconds=self.pose_timeout):
             if not self.timeout_active:
                 self.timeout_active = True
@@ -490,13 +495,13 @@ class LineDriveNode(Node):
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
                 self._publish_twist(0.0, 0.0, 0.0)
             return
-        # 2) Timeout에서 회복된 첫 주기: grace 설정
+    # (A2) Timeout에서 회복된 첫 주기: grace 설정 (재인식 직후 정지 유지)
         if self.timeout_active:
             self.timeout_active = False
             self.resume_block_until = now + Duration(seconds=self.post_timeout_grace)
             self._last_grace_log_time = now
             self.get_logger().warn(f"[safety] pose recovered; holding still for {self.post_timeout_grace:.2f}s grace")
-        # 3) Grace 기간 동안은 제어 차단 (강제 정지 유지)
+    # (A3) Grace 기간: 제어 차단 (수동 포함) + 주기적 남은 시간 로그
         if self.resume_block_until is not None and now < self.resume_block_until:
             # 주기적으로 남은 시간 로그 (0.25s 간격)
             if self._last_grace_log_time is None or (now - self._last_grace_log_time) > Duration(seconds=0.25):
@@ -506,23 +511,23 @@ class LineDriveNode(Node):
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
                 self._publish_twist(0.0, 0.0, 0.0)
             return
-        # Grace 종료
+    # (A4) Grace 종료: 정상 제어 재개
         if self.resume_block_until is not None and now >= self.resume_block_until:
             self.resume_block_until = None
             self.get_logger().info("[safety] grace ended; resuming control")
-        # 0) 수동(hold-to-run) 우선 처리 (grace 기간엔 이미 return 되었음)
+    # (B) 수동(hold-to-run) 우선 처리 (grace 기간엔 이미 return)
         manual_dir = self._manual_active()
         if manual_dir != 0:
             self._do_manual(manual_dir)
             return
 
-        # 1) 수동 아님 + "아무 목표/페이즈도 없음" => 정지하고 리턴
+    # (C) 수동 아님 + "아무 목표/페이즈도 없음" => 정지 후 리턴
         if (not self.goal_active) and (self.phase not in (Phase.ALIGN_YAW, Phase.SLOW_START, Phase.RUNNING, Phase.ALIGN_Y_ONLY)):
             if (self.last_twist.linear.x != 0.0) or (self.last_twist.linear.y != 0.0) or (self.last_twist.angular.z != 0.0):
                 self._publish_twist(0.0, 0.0, 0.0)
             return
 
-        # 2) 나머지는 기존 상태기계대로
+    # (D) 상태 머신 분기
         if self.phase == Phase.ALIGN_YAW:
             self._do_align_yaw()
             return
@@ -722,14 +727,17 @@ class LineDriveNode(Node):
         self.last_twist = t
 
     def _yaw_err(self, consider_reverse: bool = False):
-        """(yaw - target) 형태의 heading 오차 반환.
+        """현재 heading 오차 (yaw_meas - target).
 
-        target 기본값은 0 rad(+X). consider_reverse=True이고 allow_reverse_heading=True이면
-        0 또는 ±π 중에서 |yaw - target_candidate|가 더 작은 목표를 선택.
+        반환값:
+            forward-only: target=0(+X).
+            reverse 고려: target 후보 {0, ±π(부호=측정 yaw)} 중 |yaw - target| 최소.
 
-        제어식은 w = -kp * yaw_err 로 사용하여 음의 피드백이 되도록 한다.
+        사용:
+            w_cmd = -kp_yaw * yaw_err (음의 피드백).
 
-        경계(±π) 부근 sign flip 억제를 위해 yaw_sign_fixed 적용.
+        안정화:
+            yaw_wrap_band 내에서는 이전 부호(yaw_sign_fixed)를 유지하여 ±π 경계 진동 억제.
         """
         # 측정 yaw 안정화
         if self.yaw_sign_fixed != 0 and abs(abs(self.yaw) - math.pi) < self.yaw_wrap_band:
