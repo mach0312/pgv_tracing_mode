@@ -13,8 +13,10 @@
 * Yaw 정렬 (ALIGN_YAW) + 선택적 Slow Start 전진
 * 절대/상대 X 목표 추종 (RUNNING) 과 Y=0 유지
 * 홀로노믹 전용 Y축 정렬 (ALIGN_Y_ONLY) + Yaw 히스테리시스 (미세 도리도리 억제)
-* Hold-to-run 수동 전/후진 명령 (다른 목표보다 우선)
-* Pose 입력 타임아웃 안전 정지
+* Hold-to-run 수동 전/후진 (teleop_speed / manual_timeout 기반)
+* Pose 입력 타임아웃 감지 + 재인식 후 Grace(유예) 정지 (`post_timeout_grace_sec`)
+* Reverse heading 허용(±180°를 정렬로 인정) 옵션 (`allow_reverse_heading`)
+* ±π 경계 진동 억제 wrap band (`yaw_wrap_band_deg`)로 yaw 부호 안정화
 * Slew rate(가속) 제한 + 속도/각속도 클램프
 * YAML 파라미터 / launch 파일 제공
 * Dummy PGV 시뮬레이터(`sim_dummy_pgv.py`) 포함 → 실제 센서 없이 폐루프 테스트 가능
@@ -116,20 +118,69 @@ ros2 launch pgv_tracing_mode test_line_drive_sim.launch.py
 | `holonomic` | bool | 제어 모드 (홀로/비홀로) |
 | `yaw_align_threshold_deg` | deg | ALIGN_YAW 종료 기준 |
 | `tolerance_yaw_deg` | deg | 안정 yaw 허용 오차 |
-| `yaw_hysteresis_factor` | - | Y-only yaw 히스테리시스 외측 배수 |
+| `yaw_hysteresis_factor` | - | Y-only yaw 히스테리시스 외측 배수 (>|tol_yaw|*factor 시 활성, ≤|tol_yaw| 시 비활성) |
 | `tolerance_xy` | m | 목표/정렬 X,Y 허용 오차 |
 | `pose_timeout_sec` | s | Pose 수신 타임아웃 (안전 정지) |
+| `post_timeout_grace_sec` | s | 타임아웃 후 Pose 회복 시 추가 정지 유지 유예시간 |
 | `control_rate` | Hz | 제어 루프 주파수 |
 | `max_lin_vel` / `max_ang_vel` | m/s, rad/s | 속도 상한 |
 | `accel_lin` / `accel_ang` | m/s², rad/s² | Slew (가속) 제한 |
 | `slow_start_duration` / `slow_start_speed` | s, m/s | Slow start 설정 |
 | `teleop_speed` | m/s | 수동 hold-to-run 속도 |
 | `manual_timeout` | s | 수동 TRUE 유지 시간 |
+| `allow_reverse_heading` | bool | ±180° 방향도 정렬 허용 (최소 회전 목표 선택) |
+| `yaw_wrap_band_deg` | deg | ±π 경계 부근 부호 고정 밴드 폭 (진동 억제) |
+| `align_y_only_max_ang_vel` | rad/s | Y-only 단계 yaw 미세 보정 soft 상한 (주석 처리 시 비활성) |
 | `sensor_x_offset` / `sensor_y_offset` | m | 센서 장착 위치 보정 |
 | `sensor_yaw_offset_deg` | deg | 센서 yaw 오프셋 |
 | `kp_x`, `kp_y`, `kp_yaw` | - | P 게인 |
 
 > 센서 중심을 라인 중앙에 맞추는 것이 기본 가정. 오프셋을 넣으면 로봇(또는 Base) 기준 정렬로 전환.
+### Yaw 제어 및 Reverse Heading
+
+`_yaw_err()` 는 `(yaw_meas - target)` 형태의 오차를 반환합니다.
+
+1. 기본 target = 0 rad (+X).
+2. `allow_reverse_heading=true` 이고 `consider_reverse=True` 로 호출된 문맥에서는 후보 {0, ±π(측정 yaw 부호 유지)} 중 |yaw - candidate|가 더 작은 목표를 선택 → 최소 회전량.
+3. 회전 제어는 음의 피드백 `w = -kp_yaw * yaw_err` 형태. yaw_err>0 (좌측(CCW)로 기울었을 때) → 음수 각속도(w<0) → 시계방향 회전으로 0쪽 수렴.
+4. ±π 경계 근처(| |yaw| - π | < yaw_wrap_band_deg)에서는 sign flip을 억제하기 위해 기존 yaw 부호를 고정(`yaw_sign_fixed`).
+
+Holonomic 모드에서는 정렬 이후 일반적으로 w=0을 유지하며 필요 시 미세 보정(현재 기본 설정에서는 비활성화). Non-holonomic은 y 오차와 yaw 오차를 각속도로 동시에 보정합니다.
+
+### 타임아웃 & Grace 복구
+
+1. `pose_timeout_sec` 동안 새로운 Pose 미수신 → 즉시 STOP, `timeout_active=True`.
+2. Pose가 다시 들어오는 첫 틱 → `post_timeout_grace_sec` 동안 추가 정지 (센서 튀는 값/재정렬 안정 확보).
+3. Grace 진행 중 수동 hold-to-run 입력도 무시되고 주기적으로 남은 시간이 로그로 출력.
+4. Grace 종료 후 상태 머신 정상 재개.
+
+로그 예시:
+```
+[safety] pose timeout detected -> STOP
+[safety] pose recovered; holding still for 1.00s grace
+[safety] grace active: 0.76s remaining
+[safety] grace ended; resuming control
+```
+
+### Y-only 정렬 히스테리시스
+
+ALIGN_Y_ONLY 단계에서 yaw 보정은 |yaw_err|가 `tolerance_yaw_deg * yaw_hysteresis_factor` 보다 클 때만 활성화하고, 다시 |yaw_err| ≤ tolerance_yaw_deg 로 작아지면 비활성화하여 미세 흔들림을 줄입니다. 기본 코드에서는 w_cmd 보정 블록이 주석 처리되어 vy만 사용한 순수 Y 정렬을 수행합니다. 필요 시 주석을 해제하고 `align_y_only_max_ang_vel` 로 soft 포화를 적용할 수 있습니다.
+
+### Hold-to-run 전략
+
+`/line_drive/go_forward` 또는 `/line_drive/go_backward` 에 TRUE 펄스를 계속 보내면 `manual_timeout` 내에서 해당 방향 속도(`teleop_speed`)로 유지됩니다. 양 방향이 동시에 활성이면 안전을 위해 정지합니다.
+
+### 파라미터 튜닝 가이드 (요약)
+
+| 목적 | 권장 조정 파라미터 | 메모 |
+|------|--------------------|------|
+| 정렬 빠르게 | kp_yaw ↑, yaw_align_threshold_deg ↑ (조금) | 과도하면 진동 ↑ |
+| 정렬 안정 | kp_yaw ↓, yaw_wrap_band_deg ↑ | wrap 너무 크면 반응 둔화 |
+| 센서 튐 대비 | post_timeout_grace_sec ↑ | 너무 길면 재개 지연 |
+| 측면 수렴 속도 | kp_y ↑ | 과도하면 oscillation |
+| Holonomic 미세 yaw 보정 | align_y_only_max_ang_vel 설정 + w_cmd 블록 활성 | 기본은 비활성 |
+| Reverse 허용 여부 | allow_reverse_heading toggle | 물리 방향성 없는 경우만 true 추천 |
+
 
 > 💡 **기본 설계 원칙**
 > 센서(R4)가 라인 중앙에 위치하도록 제어하는 것이 목표이므로
@@ -236,6 +287,15 @@ pgv_tracing_mode/
   Holonomic → 측면 이동 가능 플랫폼(예: Mecanum, Omni).
   Non-holonomic → 차동·조향형(예: Double Steering Drive).
   동일한 제어 구조로 모두 대응.
+
+* **Reverse Heading 허용**
+  라인 방향성이 없는 경우 `allow_reverse_heading=true` 로 설정하면 +X 또는 -X(±π) 중 더 가까운 방향을 정렬 목표로 삼아 최소 회전량만 수행합니다. 긴 회전 시간을 줄이고 ±π 근처 불안정한 flip을 wrap band 로 억제합니다.
+
+* **Timeout Grace 복구**
+  센서 일시 끊김 후 바로 폭주하는 상황을 방지하기 위해 pose 회복 후 짧은 유예시간을 두어 제어 입력 안정화/재평가 시간을 확보합니다.
+
+* **Yaw Error 음의 피드백**
+  yaw_err = (yaw_meas - target) 정의 후 w = -kp_yaw * yaw_err 로 단순/직관 음의 피드백을 적용하여 부호 혼동을 제거했습니다.
 
 ---
 
