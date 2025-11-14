@@ -276,7 +276,7 @@ class LineDriveNode(Node):
         self.mode = msg.mode
 
         if command == NavCommander.CMD_START:
-            self.info(f'Nav_Commander Received: CMD_START, Mode: {msg.mode}, Target_Point: {msg.target_point}, Target_Points: {msg.target_points}, Poses: {len(msg.poses)}')
+            self.get_logger().info(f'Nav_Commander Received: CMD_START, Mode: {msg.mode}, Target_Point: {msg.target_point}, Target_Points: {msg.target_points}, Poses: {len(msg.poses)}')
             if msg.mode == NavCommander.MODE_GOTO:
                 self.goal_abs_x = float(msg.target_point)
                 self.goal_rel_dx = None
@@ -568,11 +568,6 @@ class LineDriveNode(Node):
         if self.phase == Phase.DONE:
             # keep stopped
             self._publish_twist(0.0, 0.0, 0.0)
-            nav_status_msg = NavStatus()
-            nav_status_msg.reqid = self.req_id
-            nav_status_msg.seqid = self.seq_id
-            nav_status_msg.state = NavStatus.SUCCEEDED
-            self.nav_status_pub.publish(nav_status_msg)
             return
 
     # ---------------- Behaviors ----------------
@@ -702,6 +697,11 @@ class LineDriveNode(Node):
             self._enter_done()
             self.get_logger().info("[goal] reached")
             self.get_logger().info(f"[goal] final pose: x={self.x:.3f}, y={self.y:.3f}, yaw={math.degrees(self.yaw):.2f} deg")
+            nav_status_msg = NavStatus()
+            nav_status_msg.reqid = self.req_id
+            nav_status_msg.seqid = self.seq_id
+            nav_status_msg.state = NavStatus.SUCCEEDED
+            self.nav_status_pub.publish(nav_status_msg)
             return
 
         if self.holonomic:
