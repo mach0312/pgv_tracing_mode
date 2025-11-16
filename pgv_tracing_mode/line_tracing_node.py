@@ -814,13 +814,18 @@ class LineDriveNode(Node):
         time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
         time_phase=time_phase_delta / self._micro_interval
 
-        if time_phase <1.0: # 가속 구간
+        if time_phase <0.3: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            vx_cmd = cubic_interpolation(0.0, self._microcon_delta_x, time_phase, 0.0, 1.0)[1]
-            vy_cmd = cubic_interpolation(0.0, self._microcon_delta_y, time_phase, 0.0, 1.0)[1]
+            vx_cmd = self._microcon_delta_x / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
+            vy_cmd = self._microcon_delta_y / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
+            self._publish_twist(vx_cmd, vy_cmd, 0)
+        elif time_phase <1.3: # 가속 구간
+            # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
+            vx_cmd = cubic_interpolation(0.0, self._microcon_delta_x, time_phase, 0.3, 1.3)[1]
+            vy_cmd = cubic_interpolation(0.0, self._microcon_delta_y, time_phase, 0.3, 1.3)[1]
             self._publish_twist(vx_cmd, vy_cmd, 0)
 
-        elif time_phase >=1.0 and time_phase <1.5: # 정지 위치 안정화
+        elif time_phase >=1.3 and time_phase <1.6: # 정지 위치 안정화
             vx_cmd = 0.0
             vy_cmd = 0.0
             self._publish_twist(vx_cmd, vy_cmd, 0)
@@ -856,13 +861,20 @@ class LineDriveNode(Node):
         time_phase_delta = (self.get_clock().now() - self._micro_last_time).nanoseconds / 1e9 
         time_phase=time_phase_delta / self._micro_interval
 
-        if time_phase <1.0: # 가속 구간
+        if time_phase <0.3: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.0, 1.0)[1]
+            vx_cmd = self._microcon_delta_x / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
+            vy_cmd = self._microcon_delta_y / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
+            wz_cmd = self._microcon_delta_yaw *0.0001
+            self._publish_twist(vx_cmd, vy_cmd, wz_cmd)
+
+        elif time_phase <1.3: # 가속 구간
+            # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
+            w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.3, 1.3)[1]
             x_cmd = w_cmd/0.8 # 센서 점을 기준으로 회전하게 하기 위한 보정
             self._publish_twist(x_cmd, 0.0, w_cmd)
 
-        elif time_phase >=1.0 and time_phase <1.5: # 정지 위치 안정화
+        elif time_phase >=1.3 and time_phase <1.6: # 정지 위치 안정화
             self._publish_twist(0.0, 0.0, 0.0)
 
         else: # 종료
