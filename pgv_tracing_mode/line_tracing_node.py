@@ -863,15 +863,14 @@ class LineDriveNode(Node):
 
         if time_phase <0.3: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
-            vx_cmd = self._microcon_delta_x / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
-            vy_cmd = self._microcon_delta_y / math.hypot(self._microcon_delta_x, self._microcon_delta_y) *0.0001
             wz_cmd = self._microcon_delta_yaw *0.0001
-            self._publish_twist(vx_cmd, vy_cmd, wz_cmd)
+            vx_cmd = wz_cmd/0.51 # 센서 점을 기준으로 회전하게 하기 위한 보정
+            self._publish_twist(vx_cmd, 0.0, wz_cmd)
 
         elif time_phase <1.3: # 가속 구간
             # 에러 벡터 기반 3차 보간 -> 속도 지령 계산 -> 출력
             w_cmd = cubic_interpolation(0.0, self._microcon_delta_yaw, time_phase, 0.3, 1.3)[1]
-            x_cmd = w_cmd/0.8 # 센서 점을 기준으로 회전하게 하기 위한 보정
+            x_cmd = w_cmd/0.51 # 센서 점을 기준으로 회전하게 하기 위한 보정
             self._publish_twist(x_cmd, 0.0, w_cmd)
 
         elif time_phase >=1.3 and time_phase <1.6: # 정지 위치 안정화
